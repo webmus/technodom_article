@@ -1,0 +1,1393 @@
+<?xml version="1.0" encoding="utf-8"?>
+<dleplugin>
+    <name>technodom_parser</name>
+    <description>Парсер Technodom → GPT → DLE (дашборд, генерация статьи, публикация)</description>
+    <icon></icon>
+    <version>0.1.0</version>
+    <dleversion></dleversion>
+    <versioncompare>greater</versioncompare>
+    <upgradeurl></upgradeurl>
+    <filedelete>0</filedelete>
+    <needplugin></needplugin>
+    <mnotice>0</mnotice>
+    <mysqlinstall><![CDATA[
+INSERT INTO {prefix}_admin_sections (`name`, `title`, `descr`, `icon`, `allow_groups`)
+VALUES ('technodom_parser', 'Technodom Parser', 'Technodom Parser', '', '1')
+ON DUPLICATE KEY UPDATE
+    `title` = VALUES(`title`),
+    `descr` = VALUES(`descr`),
+    `icon` = VALUES(`icon`),
+    `allow_groups` = VALUES(`allow_groups`);
+]]></mysqlinstall>
+    <mysqlupgrade><![CDATA[]]></mysqlupgrade>
+    <mysqlenable><![CDATA[]]></mysqlenable>
+    <mysqldisable><![CDATA[]]></mysqldisable>
+    <mysqldelete><![CDATA[
+DELETE FROM {prefix}_admin_sections WHERE name='technodom_parser';
+]]></mysqldelete>
+    <phpinstall><![CDATA[
+if (!defined('DATALIFEENGINE')) {
+    return;
+}
+
+$cacheDir = ROOT_DIR . '/td_cache';
+if (!is_dir($cacheDir)) {
+    @mkdir($cacheDir, 0775, true);
+}
+
+$logDir = $cacheDir . '/logs';
+if (!is_dir($logDir)) {
+    @mkdir($logDir, 0775, true);
+}
+]]></phpinstall>
+    <phpupgrade><![CDATA[]]></phpupgrade>
+    <phpenable><![CDATA[]]></phpenable>
+    <phpdisable><![CDATA[]]></phpdisable>
+    <phpdelete><![CDATA[]]></phpdelete>
+    <file name="td_config.php">
+        <operation action="create">
+            <replacecode><![CDATA[<?php
+// === Конфиг Technodom → GPT → DLE ===
+
+// 1) Хранение ключа OpenAI
+// ВАРИАНТ A: через переменную окружения (рекомендуется)
+$OPENAI_API_KEY = getenv('OPENAI_API_KEY') ?: '';
+
+// ВАРИАНТ B: через защищённый файл (вне webroot)
+//   $OPENAI_API_KEY = trim(@file_get_contents('/var/secure/openai.key') ?: '');
+
+// Fallback: если вдруг не нашли — аварийно остановимся
+if (!$OPENAI_API_KEY) {
+    http_response_code(500);
+    die('OpenAI API key not configured. Set OPENAI_API_KEY env or file.');
+}
+
+// 2) Модель и параметры по умолчанию
+const OPENAI_MODEL   = 'gpt-4o-mini';  // быстро и Й; можно 'gpt-4o'
+const OPENAI_BASEURL = 'https://api.openai.com/v1/chat/completions';
+const OPENAI_TIMEOUT = 25; // сек.
+
+// 3) DLE DB (заполните под себя или подключите общий конфиг)
+const DB_HOST = 'localhost';       // например, 127.0.0.1
+const DB_USER = 'dle_user';       // пользователь БД
+const DB_PASS = 'dle_password';   // пароль БД
+const DB_NAME = 'dle_database';   // имя БД
+const DB_CHARSET = 'utf8mb4';
+
+// 4) Параметры публикации
+const DEFAULT_DLE_CAT_ID = 9;      // категория по умолчанию
+const DEFAULT_ALLOW_COMM = 0;      // комментарии: 0=запрещены
+const DEFAULT_ALLOW_MAIN = 1;      // показывать на главной
+const DEFAULT_PUBLISH    = 1;      // по умолчанию публиковать
+const DEFAULT_AUTHOR     = 'admin';// логин автора (должен существовать в DLE)
+
+// 5) Служебные пути
+const CACHE_DIR = __DIR__ . '/td_cache';
+@mkdir(CACHE_DIR, 0775, true);
+]]></replacecode>
+            <enabled>1</enabled>
+        </operation>
+    </file>
+    <file name="td_gpt.php">
+        <operation action="create">
+            <replacecode><![CDATA[<?php
+require_once __DIR__ . '/td_config.php';
+
+/**
+ * Переписывает статью через GPT (title, short, full, meta).
+ * Возвращает массив с теми же ключами, что и вход, если всё ок.
+ * При ошибке вернёт исходные поля (фоллбэк), но оставит пометку в meta_description.
+ */
+function td_gpt_rewrite(array $article, string $categoryName, string $slug): array {
+    $title       = $article['title']            ?? '';
+    $short_story = $article['short_story']      ?? '';
+    $full_story  = $article['full_story']       ?? '';
+    $meta_title  = $article['meta_title']       ?? '';
+    $meta_desc   = $article['meta_description'] ?? '';
+    $hashtags    = $article['hashtags']         ?? ($slug . ', Актау');
+
+    // Промпт: коротко и по делу; просим корректный HTML без лишнего мусора
+    $system = "Ты опытный русскоязычный редактор и SEO-копирайтер. Перепиши текст лаконично и полезно, сохраняя факты (цены/бренды/характеристики). Выдай чистый HTML (абзацы <p>, подзаголовки <h3>, таблицы как есть), без инлайн-стилей, без лишней воды. Мета-заголовок до ~70 символов, мета-описание до ~160. Тон — информативный, без агрессивных продаж.";
+    $user = [
+        "category"     => $categoryName,
+        "slug"         => $slug,
+        "title"        => $title,
+        "short_story"  => $short_story,
+        "full_story"   => $full_story,
+        "meta_title"   => $meta_title,
+        "meta_desc"    => $meta_desc,
+        "hashtags"     => $hashtags
+    ];
+
+    $payload = [
+        "model" => OPENAI_MODEL,
+        "temperature" => 0.4,
+        "messages" => [
+            ["role" => "system", "content" => $system],
+            ["role" => "user",   "content" => "Вот данные статьи в JSON. Перепиши: верни JSON с полями title, short_story, full_story, meta_title, meta_description, hashtags.\n\n" . json_encode($user, JSON_UNESCAPED_UNICODE)]
+        ]
+    ];
+
+    $resp = openai_chat($payload);
+    if (!$resp || empty($resp['choices'][0]['message']['content'])) {
+        // Фоллбэк: возвращаем исходник с пометкой
+        $article['meta_description'] = ($article['meta_description'] ?? '') . ' (auto: fallback)';
+        return $article;
+    }
+
+    // Парсим JSON из ответа
+    $txt = trim($resp['choices'][0]['message']['content']);
+    $clean = try_json($txt);
+    if (!$clean) {
+        // Иногда модель отдаёт текст с ```json
+        $txt = trim(preg_replace('~^```json|```$~m', '', $txt));
+        $clean = try_json($txt);
+    }
+    if (!$clean) {
+        $article['meta_description'] = ($article['meta_description'] ?? '') . ' (auto: parse-fallback)';
+        return $article;
+    }
+
+    // Сливаем, оставляя обязательные поля
+    $out = [
+        'title'            => $clean['title']            ?? $title,
+        'short_story'      => $clean['short_story']      ?? $short_story,
+        'full_story'       => $clean['full_story']       ?? $full_story,
+        'meta_title'       => $clean['meta_title']       ?? $meta_title,
+        'meta_description' => $clean['meta_description'] ?? $meta_desc,
+        'hashtags'         => $clean['hashtags']         ?? $hashtags,
+    ];
+
+    // Страховка: clean HTML от <script> и мусора
+    $out['full_story'] = preg_replace('~<script\b[^>]*>.*?</script>~is', '', $out['full_story']);
+    return $out;
+}
+
+/** Вызов OpenAI с ретраями */
+function openai_chat(array $payload): ?array {
+    global $OPENAI_API_KEY;
+
+    $attempts = 3;
+    $sleep    = 1;
+    for ($i=0; $i<$attempts; $i++) {
+        $ch = curl_init(OPENAI_BASEURL);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => OPENAI_TIMEOUT,
+            CURLOPT_CONNECTTIMEOUT => 8,
+            CURLOPT_HTTPHEADER     => [
+                'Authorization: Bearer ' . $OPENAI_API_KEY,
+                'Content-Type: application/json'
+            ],
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => json_encode($payload, JSON_UNESCAPED_UNICODE)
+        ]);
+        $body = curl_exec($ch);
+        $code = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        $err  = curl_error($ch);
+        curl_close($ch);
+
+        if ($code === 200 && $body) {
+            $j = json_decode($body, true);
+            if (is_array($j)) return $j;
+        }
+        // 429/5xx — подождём и попробуем ещё
+        if (in_array($code, [429,500,502,503,504], true)) {
+            usleep($sleep * 1000000);
+            $sleep *= 2;
+            continue;
+        }
+        // Прочие ошибки — выходим
+        return null;
+    }
+    return null;
+}
+
+function try_json(string $s): ?array {
+    $j = json_decode($s, true);
+    return is_array($j) ? $j : null;
+}
+]]></replacecode>
+            <enabled>1</enabled>
+        </operation>
+    </file>
+    <file name="td_build_article.php">
+        <operation action="create">
+            <replacecode><![CDATA[<?php
+declare(strict_types=1);
+
+/**
+ * td_build_article.php  (v3 — HTML preview + JSON)
+ * Режимы:
+ *   ?ping=1                    — пинг
+ *   ?json=1                    — сырой JSON
+ *   (по умолчанию)             — HTML-предпросмотр (Bootstrap)
+ * Параметры:
+ *   slug, name (опц.), asc, desc, limit (по умолчанию 10), log=1
+ *   или только slug — asc/desc подтянутся из CSV (см. CSV_PATH).
+ */
+
+ini_set('display_errors', '0');
+error_reporting(E_ALL);
+
+// ---------- Константы / Настройки ----------
+const CITY_LABEL   = 'Актау';
+const ATTRIB_TXT   = 'Материал подготовлен на основании открытых данных Technodom (technodom.kz). Цены и наличие актуальны на момент публикации и могут изменяться. Ссылки ведут на карточки товаров Technodom.';
+const CSV_PATH     = __DIR__ . '/td_cache/technodom_categories_links.csv';
+const LOGS_DIR     = __DIR__ . '/td_cache/logs';
+const NAME_CACHE   = __DIR__ . '/td_cache/name_cache.json';
+const UA           = 'ArtVisionTD/1.0 (+vaktau.kz)';
+
+// ---------- Утилиты ----------
+function ok(array $data = []): void {
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(['ok' => true] + $data, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+    exit;
+}
+function fail(string $msg, array $extra = []): void {
+    header('Content-Type: application/json; charset=utf-8');
+    http_response_code(400);
+    echo json_encode(['ok' => false, 'error' => $msg] + $extra, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+    exit;
+}
+function ensureDir(string $path): void { if (!is_dir($path)) @mkdir($path, 0775, true); }
+function logLine(string $line): void {
+    static $enabled = null;
+    if ($enabled === null) {
+        $enabled = (int)($_GET['log'] ?? 0) === 1;
+        if ($enabled) ensureDir(LOGS_DIR);
+    }
+    if (!$enabled) return;
+    $file = LOGS_DIR . '/' . date('Y-m-d') . '.log';
+    @file_put_contents($file, '[' . date('H:i:s') . "] " . $line . PHP_EOL, FILE_APPEND);
+}
+function httpJson(string $url, int $timeout = 25): array {
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_TIMEOUT        => $timeout,
+        CURLOPT_CONNECTTIMEOUT => 8,
+        CURLOPT_ENCODING       => 'gzip,deflate',
+        CURLOPT_HTTPHEADER     => [
+            'Accept: application/json',
+            'User-Agent: ' . UA,
+            'Origin: https://www.technodom.kz',
+            'Referer: https://www.technodom.kz/'
+        ],
+    ]);
+    $body = curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    $err  = curl_error($ch);
+    curl_close($ch);
+
+    if ($code !== 200 || !$body) {
+        logLine("HTTP $code $url :: $err");
+        return [];
+    }
+    $j = json_decode($body, true);
+    if (!is_array($j)) return [];
+    return $j['payload'] ?? $j;
+}
+function numberKZT(?int $n): string { return $n === null ? '' : number_format($n, 0, '.', ' ') . ' ₸'; }
+
+// ---------- Нормализация ----------
+function normalizeItems(array $payload): array {
+    $list = $payload['items'] ?? $payload;
+    if (!is_array($list)) return [];
+    $out = [];
+    foreach ($list as $p) {
+        if (!is_array($p)) continue;
+        $imgId = $p['images'][0] ?? null;
+        $img   = $imgId ? "https://static.technodom.kz/medias/{$imgId}.jpg" : null;
+
+        $specs = [];
+        if (!empty($p['short_description']) && is_array($p['short_description'])) {
+            foreach ($p['short_description'] as $s) {
+                $k = trim((string)($s['title'] ?? ''));
+                $v = trim((string)($s['values'][0]['value_ru'] ?? ''));
+                if ($k && $v) $specs[$k] = $v;
+            }
+        }
+
+        $out[] = [
+            'sku'        => (string)($p['sku'] ?? ''),
+            'title'      => (string)($p['title'] ?? ''),
+            'brand'      => (string)($p['brand'] ?? ($p['brand_info']['title'] ?? '')),
+            'price'      => isset($p['price']) ? (int)$p['price'] : null,
+            'old_price'  => isset($p['old_price']) ? (int)$p['old_price'] : null,
+            'discount'   => isset($p['discount']) ? (int)$p['discount'] : 0,
+            'rating'     => $p['rating'] ?? null,
+            'reviews'    => $p['reviews'] ?? null,
+            'uri'        => (string)($p['uri'] ?? ''),
+            'image'      => $img,
+            'specs'      => $specs,
+        ];
+    }
+    // дедуп
+    $seen = []; $clean = [];
+    foreach ($out as $it) {
+        $k = $it['sku'] ?: $it['uri'];
+        if (!$k || isset($seen[$k])) continue;
+        $seen[$k] = true;
+        $clean[]  = $it;
+    }
+    return $clean;
+}
+function pickTop(array $arr, int $n): array { return array_slice($arr, 0, $n); }
+
+// ---------- Таблица HTML ----------
+function tableHtml(array $items, string $caption): string {
+    $rows = '';
+    foreach ($items as $it) {
+        $href    = 'https://www.technodom.kz/aktau/' . ltrim($it['uri'], '/');
+        $keySpec = '';
+        if (!empty($it['specs'])) {
+            foreach ($it['specs'] as $k => $v) { $keySpec = $k . ': ' . $v; break; }
+        }
+        $rows .= '<tr>'
+               . '<td class="text-truncate" style="max-width:420px">' . htmlspecialchars($it['title']) . '</td>'
+               . '<td>' . htmlspecialchars($it['brand']) . '</td>'
+               . '<td class="text-muted">' . htmlspecialchars($keySpec) . '</td>'
+               . '<td><span class="badge bg-dark-subtle text-dark">' . numberKZT($it['price']) . '</span></td>'
+               . '<td><a class="btn btn-sm btn-outline-primary" href="' . htmlspecialchars($href) . '" target="_blank" rel="nofollow noopener">Открыть</a></td>'
+               . '</tr>';
+    }
+    return '<h5 class="mt-4">' . htmlspecialchars($caption) . '</h5>'
+         . '<div class="table-responsive"><table class="table table-striped table-hover align-middle">'
+         . '<thead class="table-light"><tr>'
+         . '<th>Модель</th><th>Бренд</th><th>Ключевая характеристика</th><th>Цена</th><th></th>'
+         . '</tr></thead><tbody>' . $rows . '</tbody></table></div>';
+}
+
+// ---------- Построение статьи ----------
+function buildArticle(string $catName, string $slug, array $cheap, array $exp): array {
+    $all    = array_merge($cheap, $exp);
+    $prices = array_values(array_filter(array_column($all, 'price'), 'is_numeric'));
+    sort($prices);
+    $min = $prices[0] ?? null;
+    $max = $prices ? end($prices) : null;
+    $avg = $prices ? (int)round(array_sum($prices) / count($prices)) : null;
+
+    $title      = "Лучшие {$catName} в " . CITY_LABEL . ": от доступных до премиум-моделей";
+    $meta_title = "{$catName} в " . CITY_LABEL . " — цены, подборки и сравнение";
+
+    $min_meta = $min !== null ? $min : '';
+    $max_meta = $max !== null ? $max : '';
+    $avg_meta = $avg !== null ? $avg : '';
+
+    $meta_desc  = ($min !== null && $max !== null)
+        ? "Подборка {$catName} в " . CITY_LABEL . ": доступные и премиум-модели. Диапазон цен {$min_meta}–{$max_meta} ₸, средняя ~{$avg_meta} ₸. Обновлено: " . date('Y-m-d') . "."
+        : "Подборка {$catName} в " . CITY_LABEL . ". Обновлено: " . date('Y-m-d') . ".";
+
+    $lead  = ($min !== null && $max !== null)
+        ? "Собрали актуальные {$catName} в " . CITY_LABEL . " — от самых доступных до премиум. Диапазон цен: " . number_format($min, 0, '.', ' ') . "–" . number_format($max, 0, '.', ' ') . " ₸."
+        : "Собрали актуальные {$catName} в " . CITY_LABEL . " — от бюджетных до премиум-решений.";
+    $about = "Коротко про категорию. На что смотреть при выборе: ключевые характеристики, бренд, гарантия и соотношение цены и возможностей. Ниже — две подборки: бюджет и премиум.";
+
+    $tblCheap = tableHtml($cheap, "ТОП-10 самых доступных");
+    $tblExp   = tableHtml($exp,   "ТОП-10 премиум-моделей");
+
+    $host   = $_SERVER['HTTP_HOST'] ?? 'localhost';
+    $outro  = "Вывод. Если нужен бюджетный вариант — ориентируйтесь на базовые модели без лишних опций. Средний сегмент — баланс автономности и характеристик. Премиум берут за максимум функций и материалов. {$host}";
+
+    $short_story = $lead;
+    $full_story  = "<p>{$lead}</p>"
+                 . "<p>{$about}</p>"
+                 . $tblCheap
+                 . $tblExp
+                 . "<p>{$outro}</p>"
+                 . '<p class="small text-muted">' . ATTRIB_TXT . '</p>';
+
+    return [
+        'title'            => $title,
+        'short_story'      => $short_story,
+        'full_story'       => $full_story,
+        'meta_title'       => $meta_title,
+        'meta_description' => $meta_desc,
+        'hashtags'         => mb_strtolower($slug) . ", " . CITY_LABEL,
+    ];
+}
+
+// ---------- CSV lookup ----------
+function loadCsvMap(string $csvPath): array {
+    $map = []; if (!is_file($csvPath)) return $map;
+    if (($fh = fopen($csvPath, 'r')) === false) return $map;
+    $header = fgetcsv($fh, 0, ';'); // заголовки
+    while (($r = fgetcsv($fh, 0, ';')) !== false) {
+        $name = $r[0] ?? '';
+        $slug = $r[1] ?? '';
+        $asc  = $r[2] ?? '';
+        $desc = $r[3] ?? '';
+        if ($slug && $asc && $desc) {
+            $map[$slug] = ['name' => $name ?: $slug, 'asc' => $asc, 'desc' => $desc];
+        }
+    }
+    fclose($fh);
+    return $map;
+}
+
+// ---------- Получение нормального названия ----------
+function humanizeSlug(string $slug): string {
+    $t = str_replace(['-', '_'], ' ', $slug);
+    $t = preg_replace('~\s+~u', ' ', $t);
+    $t = trim($t);
+    if ($t === '') return $slug;
+    $first = mb_strtoupper(mb_substr($t, 0, 1, 'UTF-8'), 'UTF-8');
+    $rest  = mb_substr($t, 1, null, 'UTF-8');
+    return $first . $rest;
+}
+function loadNameCache(): array {
+    if (!is_file(NAME_CACHE)) return [];
+    $raw = @file_get_contents(NAME_CACHE);
+    $j = json_decode((string)$raw, true);
+    return is_array($j) ? $j : [];
+}
+function saveNameCache(array $cache): void {
+    ensureDir(dirname(NAME_CACHE));
+    @file_put_contents(NAME_CACHE, json_encode($cache, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
+}
+function resolveCategoryName(string $slug, ?string $preferredName = null): string {
+    if (!empty($preferredName) && $preferredName !== $slug) return $preferredName;
+
+    $cache = loadNameCache();
+    if (!empty($cache[$slug])) return $cache[$slug];
+
+    $url = "https://api.technodom.kz/menu/api/v1/menu/breadcrumbs/categories/" . rawurlencode($slug);
+    $data = httpJson($url);
+    $name = null;
+    $crumbs = $data['breadcrumbs'] ?? $data;
+    if (is_array($crumbs)) {
+        $last = end($crumbs);
+        if (is_array($last)) $name = $last['title'] ?? $last['label'] ?? $last['name'] ?? null;
+        if (!$name) {
+            foreach ($crumbs as $c) {
+                if (is_array($c) && !empty($c['title'])) $name = $c['title'];
+            }
+        }
+    }
+    if (!$name) $name = humanizeSlug($slug);
+
+    $cache[$slug] = $name;
+    saveNameCache($cache);
+    logLine("Resolved name for {$slug}: {$name}");
+    return $name;
+}
+
+// ---------- ENTRY ----------
+if (isset($_GET['ping'])) {
+    ok(['ping' => 'pong', 'now' => date('c')]);
+}
+
+$slug    = trim((string)($_GET['slug'] ?? ''));
+$name    = trim((string)($_GET['name'] ?? ''));
+$asc     = trim((string)($_GET['asc'] ?? ''));
+$desc    = trim((string)($_GET['desc'] ?? ''));
+$limit   = max(1, (int)($_GET['limit'] ?? 10)); // сколько брать в таблицы
+$jsonOut = (int)($_GET['json'] ?? 0) === 1;
+
+if ($slug && (!$asc || !$desc)) {
+    $map = loadCsvMap(CSV_PATH);
+    if (isset($map[$slug])) {
+        $asc  = $asc  ?: $map[$slug]['asc'];
+        $desc = $desc ?: $map[$slug]['desc'];
+        $name = $name ?: ($map[$slug]['name'] ?? '');
+        logLine("CSV matched slug={$slug}");
+    }
+}
+
+if (!$slug || !$asc || !$desc) {
+    fail('Передай параметры: slug, asc, desc (name — опц.) или подготовь CSV для автоподстановки.', [
+        'example' => [
+            'ping' => '?ping=1',
+            'full' => '?slug=vneshnie-akkumuljatory&name=Внешние%20аккумуляторы'
+                    . '&asc=' . rawurlencode('https://api.technodom.kz/katalog/api/v2/products/category/vneshnie-akkumuljatory?city_id=5f5f1e346a600b98a31fddb5&limit=24&sorting=price%3Aasc')
+                    . '&desc=' . rawurlencode('https://api.technodom.kz/katalog/api/v2/products/category/vneshnie-akkumuljatory?city_id=5f5f1e346a600b98a31fddb5&limit=24&sorting=price%3Adesc'),
+            'slug_only' => '?slug=vneshnie-akkumuljatory&limit=10&log=1 (если есть CSV)',
+        ]
+    ]);
+}
+
+$catName = resolveCategoryName($slug, $name);
+
+// Снятие данных
+logLine("Fetch ASC for {$slug}");
+$ascPayload = httpJson($asc);
+usleep(100000);
+logLine("Fetch DESC for {$slug}");
+$descPayload = httpJson($desc);
+
+// Нормализация
+$cheap = pickTop(normalizeItems($ascPayload),  $limit);
+$exp   = pickTop(normalizeItems($descPayload), $limit);
+
+// Фоллбэки
+if (count($cheap) < 3 && count($exp) > 0) { $cheap = array_slice(array_reverse($exp), 0, $limit); }
+if (count($exp)   < 3 && count($cheap) > 0) { $exp   = array_slice(array_reverse($cheap), 0, $limit); }
+if (count($cheap) === 0 && count($exp) === 0) {
+    fail('Не удалось получить товары по переданным ссылкам (или пустые ответы). Проверь ASC/DESC URL.');
+}
+
+// Статья
+$article = buildArticle($catName, $slug, $cheap, $exp);
+
+// ---------- JSON режим ----------
+if ($jsonOut) {
+    ok([
+        'slug'            => $slug,
+        'cheap_count'     => count($cheap),
+        'expensive_count' => count($exp),
+        'data'            => $article,
+        'asc_url'         => $asc,
+        'desc_url'        => $desc
+    ]);
+}
+
+// ---------- HTML Preview ----------
+$title = htmlspecialchars($article['title']);
+$lead  = $article['short_story'];
+$full  = $article['full_story'];
+$metaTitle = htmlspecialchars($article['meta_title']);
+$metaDesc  = htmlspecialchars($article['meta_description']);
+$hashtags  = htmlspecialchars($article['hashtags']);
+
+?><!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Предпросмотр: <?= $title ?></title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Bootstrap 5 -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { background:#f8fafc; }
+    .container-narrow { max-width: 1100px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+    pre.code { background:#0f172a; color:#e2e8f0; padding:16px; border-radius:12px; }
+    .card-shadow { box-shadow: 0 10px 25px rgba(0,0,0,.05); }
+  </style>
+</head>
+<body>
+<div class="container container-narrow py-4">
+  <div class="d-flex align-items-center gap-3 mb-3">
+    <h2 class="m-0">🧱 Предпросмотр статьи</h2>
+    <span class="badge text-bg-secondary"><?= htmlspecialchars($slug) ?></span>
+  </div>
+
+  <div class="alert alert-success py-2">
+    ✅ Получено товаров: <b><?= count($cheap) ?></b> (дешёвые) и <b><?= count($exp) ?></b> (дорогие)
+  </div>
+
+  <div class="card card-shadow mb-4">
+    <div class="card-body">
+      <h3 class="card-title"><?= $title ?></h3>
+      <p class="card-text"><?= $lead ?></p>
+      <hr>
+      <?= $full ?>
+    </div>
+  </div>
+
+  <div class="row g-3">
+    <div class="col-md-6">
+      <div class="card card-shadow h-100">
+        <div class="card-header bg-light">📌 Meta-данные</div>
+        <div class="card-body">
+          <div class="mb-2"><div class="text-muted small">meta_title</div><div class="mono"><?= $metaTitle ?></div></div>
+          <div class="mb-2"><div class="text-muted small">meta_description</div><div class="mono"><?= $metaDesc ?></div></div>
+          <div class="mb-2"><div class="text-muted small">hashtags</div><div class="mono"><?= $hashtags ?></div></div>
+        </div>
+      </div>
+    </div>
+    <div class="col-md-6">
+      <div class="card card-shadow h-100">
+        <div class="card-header bg-light">🔗 Источники API</div>
+        <div class="card-body">
+          <div class="mb-2"><span class="badge text-bg-dark me-2">ASC</span>
+            <a href="<?= htmlspecialchars($asc) ?>" target="_blank" rel="noopener">Открыть</a></div>
+          <div class="mb-2"><span class="badge text-bg-dark me-2">DESC</span>
+            <a href="<?= htmlspecialchars($desc) ?>" target="_blank" rel="noopener">Открыть</a></div>
+          <div class="mt-3">
+            <a class="btn btn-sm btn-outline-secondary" href="?<?= http_build_query($_GET + ['json'=>1]) ?>">Показать JSON</a>
+            <button id="copyHtml" class="btn btn-sm btn-primary ms-2">Скопировать HTML статьи</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card card-shadow my-4">
+    <div class="card-header bg-light">📄 Чистый HTML для вставки в DLE</div>
+    <div class="card-body">
+      <pre class="code"><code id="articleHtml"><?= htmlspecialchars($full) ?></code></pre>
+    </div>
+  </div>
+
+  <div class="d-flex gap-2">
+    <!-- Заготовка на будущее: публикация в категорию 9 -->
+    <a class="btn btn-success"
+       href="/td_publish.php?slug=<?= urlencode($slug) ?>&name=<?= urlencode($catName ?? $slug) ?>&asc=<?= urlencode($asc) ?>&desc=<?= urlencode($desc) ?>&dle_category_id=9&publish=0"
+       target="_blank" rel="noopener">➕ Отправить в DLE (черновик, cat=9)</a>
+    <a class="btn btn-outline-secondary" href="javascript:history.back()">← Назад</a>
+  </div>
+
+  <footer class="mt-5 text-center text-muted small">v3 preview • <?= date('Y-m-d H:i') ?></footer>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+  document.getElementById('copyHtml')?.addEventListener('click', async () => {
+    const el = document.getElementById('articleHtml');
+    try {
+      await navigator.clipboard.writeText(el.textContent);
+      alert('HTML статьи скопирован в буфер обмена!');
+    } catch (e) {
+      // Fallback
+      const range = document.createRange();
+      range.selectNode(el);
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      document.execCommand('copy');
+      sel.removeAllRanges();
+      alert('HTML статьи скопирован (fallback).');
+    }
+  });
+</script>
+</body>
+</html>
+]]></replacecode>
+            <enabled>1</enabled>
+        </operation>
+    </file>
+    <file name="td_dashboard.php">
+        <operation action="create">
+            <replacecode><![CDATA[<?php
+// td_dashboard.php — единый дашборд управления конвейером
+declare(strict_types=1);
+
+// ===== mini API: отдаём CSV как JSON для фронта =====
+if (isset($_GET['action']) && $_GET['action'] === 'csv') {
+    $csvPath = __DIR__ . '/td_cache/technodom_categories_links.csv';
+    header('Content-Type: application/json; charset=utf-8');
+    if (!is_file($csvPath)) {
+        echo json_encode(['ok'=>false,'error'=>'CSV not found'], JSON_UNESCAPED_UNICODE);
+        exit;
+    }
+    $out = [];
+    if (($fh = fopen($csvPath, 'r')) !== false) {
+        $header = fgetcsv($fh, 0, ';'); // "Название рубрики";Slug;ASC;DESC;"Sitemap URL"
+        while (($r = fgetcsv($fh, 0, ';')) !== false) {
+            $out[] = [
+                'name'  => $r[0] ?? '',
+                'slug'  => $r[1] ?? '',
+                'asc'   => $r[2] ?? '',
+                'desc'  => $r[3] ?? '',
+                'smap'  => $r[4] ?? '',
+            ];
+        }
+        fclose($fh);
+    }
+    echo json_encode(['ok'=>true,'items'=>$out], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+// для построения URL соседних скриптов
+function same_dir_url(string $file): string {
+    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+    $host   = $_SERVER['HTTP_HOST'] ?? 'localhost';
+    $dir    = rtrim(str_replace('\\','/', dirname($_SERVER['REQUEST_URI'] ?? '/')), '/');
+    if ($dir === '') $dir = '/';
+    return rtrim($scheme.'://'.$host.$dir, '/') . '/' . ltrim($file, '/');
+}
+
+$buildUrl   = same_dir_url('td_build_article.php');
+$publishUrl = same_dir_url('td_publish.php');
+?>
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>TD Dashboard — сбор → GPT → публикация</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Bootstrap 5 -->
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { background:#f8fafc; }
+    .container-narrow { max-width: 1200px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+    .card-shadow { box-shadow: 0 10px 25px rgba(0,0,0,.05); }
+    .h-40 { height: 40px; }
+    #result pre { background:#0f172a; color:#e2e8f0; padding:12px; border-radius:8px; }
+    .tableFixHead { overflow-y:auto; max-height: 320px; }
+    .tableFixHead thead th { position: sticky; top: 0; z-index: 1; background:#fff; }
+  </style>
+</head>
+<body>
+<div class="container container-narrow py-4">
+  <div class="d-flex align-items-center justify-content-between mb-3">
+    <h2 class="m-0">🧱 TD Dashboard — Technodom → GPT → DLE</h2>
+    <span class="badge text-bg-secondary">beta</span>
+  </div>
+
+  <div class="row g-3">
+    <!-- Панель настроек -->
+    <div class="col-lg-4">
+      <div class="card card-shadow">
+        <div class="card-header bg-light">⚙️ Настройки</div>
+        <div class="card-body">
+          <div class="mb-2">
+            <label class="form-label">Категория (из CSV)</label>
+            <div class="d-flex gap-2">
+              <select id="selCategory" class="form-select"></select>
+              <button id="refreshCsv" class="btn btn-outline-secondary">⟳</button>
+            </div>
+            <div class="form-text">Источник: td_cache/technodom_categories_links.csv</div>
+          </div>
+          <div class="mb-2">
+            <label class="form-label">Slug</label>
+            <input id="inSlug" type="text" class="form-control" placeholder="например: vneshnie-akkumuljatory">
+          </div>
+          <div class="row g-2">
+            <div class="col-6">
+              <label class="form-label">Лимит (в каждую таблицу)</label>
+              <input id="inLimit" type="number" class="form-control" value="10" min="1" max="50">
+            </div>
+            <div class="col-6">
+              <label class="form-label">Категория DLE (ID)</label>
+              <input id="inCatId" type="number" class="form-control" value="9" min="1">
+            </div>
+          </div>
+          <div class="mt-3 d-flex gap-3">
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" id="cbPublish" checked>
+              <label class="form-check-label" for="cbPublish">Публиковать</label>
+            </div>
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" id="cbGPT" checked>
+              <label class="form-check-label" for="cbGPT">GPT-рерайт</label>
+            </div>
+          </div>
+          <div class="mt-3">
+            <button id="btnPreview" class="btn btn-primary w-100">🔎 Предпросмотр статьи</button>
+          </div>
+          <div class="mt-2 d-grid gap-2">
+            <button id="btnPublish" class="btn btn-success">🚀 Опубликовать (GPT)</button>
+            <button id="btnDraft" class="btn btn-outline-success">📝 Черновик (GPT)</button>
+            <button id="btnNoGpt" class="btn btn-outline-secondary">⚡ Опубликовать без GPT</button>
+          </div>
+          <hr>
+          <div class="small text-muted">
+            <div>Builder: <span class="mono"><?= htmlspecialchars($buildUrl) ?></span></div>
+            <div>Publish: <span class="mono"><?= htmlspecialchars($publishUrl) ?></span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Предпросмотр -->
+    <div class="col-lg-8">
+      <div class="card card-shadow mb-3">
+        <div class="card-header bg-light">📄 Предпросмотр</div>
+        <div class="card-body" id="preview">
+          <div class="text-muted">Нажми «Предпросмотр статьи» — здесь появится заголовок, лид, таблицы и мета.</div>
+        </div>
+      </div>
+
+      <div class="card card-shadow">
+        <div class="card-header bg-light d-flex justify-content-between align-items-center">
+          <span>🧾 Журнал / Ответы API</span>
+          <div class="d-flex gap-2">
+            <button id="btnPing" class="btn btn-sm btn-outline-secondary">Ping endpoints</button>
+            <button id="btnClearLog" class="btn btn-sm btn-outline-secondary">Очистить</button>
+          </div>
+        </div>
+        <div class="card-body" id="result">
+          <pre class="mb-0" id="log" style="white-space:pre-wrap;">Готов к работе…</pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Пакетный режим -->
+  <div class="card card-shadow mt-4">
+    <div class="card-header bg-light">📦 Пакетная публикация</div>
+    <div class="card-body">
+      <div class="row g-3">
+        <div class="col-lg-8">
+          <div class="tableFixHead border rounded">
+            <table class="table table-sm mb-0" id="tblBatch">
+              <thead>
+                <tr><th style="width:36px;"><input type="checkbox" id="chAll"></th><th>Название</th><th>Slug</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div class="form-text">Отметь нужные категории и нажми «Старт пакетного прогона»</div>
+        </div>
+        <div class="col-lg-4">
+          <div class="row g-2">
+            <div class="col-6">
+              <label class="form-label">Лимит</label>
+              <input id="inBLimit" type="number" class="form-control" value="10" min="1" max="50">
+            </div>
+            <div class="col-6">
+              <label class="form-label">DLE cat</label>
+              <input id="inBCatId" type="number" class="form-control" value="9" min="1">
+            </div>
+          </div>
+          <div class="mt-2 form-check">
+            <input class="form-check-input" type="checkbox" id="cbBPublish" checked>
+            <label class="form-check-label" for="cbBPublish">Публиковать</label>
+          </div>
+          <div class="mt-2 form-check">
+            <input class="form-check-input" type="checkbox" id="cbBGPT" checked>
+            <label class="form-check-label" for="cbBGPT">GPT-рерайт</label>
+          </div>
+          <div class="mt-3 d-grid gap-2">
+            <button id="btnBatch" class="btn btn-dark">▶️ Старт пакетного прогона</button>
+            <button id="btnStop" class="btn btn-outline-danger">⏹ Остановить</button>
+          </div>
+          <div class="mt-3">
+            <div class="progress">
+              <div id="prog" class="progress-bar" role="progressbar" style="width:0%">0%</div>
+            </div>
+            <div class="small mt-1" id="batchStat">—</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <footer class="mt-4 text-center text-muted small">TD Dashboard • <?= date('Y-m-d H:i') ?></footer>
+</div>
+
+<script>
+const buildUrl   = <?= json_encode($buildUrl) ?>;
+const publishUrl = <?= json_encode($publishUrl) ?>;
+
+const selCategory = document.getElementById('selCategory');
+const inSlug      = document.getElementById('inSlug');
+const inLimit     = document.getElementById('inLimit');
+const inCatId     = document.getElementById('inCatId');
+const cbPublish   = document.getElementById('cbPublish');
+const cbGPT       = document.getElementById('cbGPT');
+
+const previewBox  = document.getElementById('preview');
+const logBox      = document.getElementById('log');
+
+function log(msg) {
+  logBox.textContent += '\\n' + msg;
+  logBox.scrollTop = logBox.scrollHeight;
+}
+function clearLog(){ logBox.textContent = 'Готов к работе…'; }
+document.getElementById('btnClearLog').onclick = clearLog;
+
+async function loadCsv() {
+  const r = await fetch('?action=csv');
+  const j = await r.json();
+  selCategory.innerHTML = '';
+  document.querySelector('#tblBatch tbody').innerHTML = '';
+  if (!j.ok) { log('CSV error: ' + (j.error || 'unknown')); return; }
+  j.items.forEach((it, idx) => {
+    const o = document.createElement('option');
+    o.value = it.slug;
+    o.textContent = `${it.name || it.slug} — ${it.slug}`;
+    o.dataset.asc = it.asc; o.dataset.desc = it.desc; o.dataset.name = it.name;
+    selCategory.appendChild(o);
+
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td><input type="checkbox" class="chRow" data-slug="${it.slug}"></td>
+                    <td>${escapeHtml(it.name || '')}</td>
+                    <td class="mono">${escapeHtml(it.slug || '')}</td>`;
+    document.querySelector('#tblBatch tbody').appendChild(tr);
+  });
+  if (j.items.length) {
+    selCategory.selectedIndex = 0;
+    inSlug.value = j.items[0].slug || '';
+  }
+  log('CSV загружен: ' + j.items.length + ' строк');
+}
+document.getElementById('refreshCsv').onclick = loadCsv;
+
+selCategory.addEventListener('change', () => {
+  const o = selCategory.options[selCategory.selectedIndex];
+  inSlug.value = o.value || '';
+});
+
+function escapeHtml(s){return (s||'').replace(/[&<>"']/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m]));}
+
+async function previewArticle() {
+  const slug  = inSlug.value.trim();
+  const limit = parseInt(inLimit.value||'10',10);
+  if (!slug) return alert('Укажи slug');
+  clearLog();
+  log('🔎 Предпросмотр: ' + slug);
+
+  const url = buildUrl + '?slug=' + encodeURIComponent(slug) + '&limit=' + limit + '&json=1';
+  const r = await fetch(url);
+  if (!r.ok) { log('Builder HTTP ' + r.status); return; }
+  const j = await r.json();
+  if (!j.ok) { log('Builder error'); return; }
+
+  const a = j.data;
+  previewBox.innerHTML = `
+    <h3 class="mb-2">${escapeHtml(a.title)}</h3>
+    <p>${a.short_story}</p>
+    <hr>
+    ${a.full_story}
+    <hr>
+    <div class="row g-2 small">
+      <div class="col-md-6"><b>meta_title:</b> <span class="mono">${escapeHtml(a.meta_title)}</span></div>
+      <div class="col-md-6"><b>meta_description:</b> <span class="mono">${escapeHtml(a.meta_description)}</span></div>
+      <div class="col-12"><b>hashtags:</b> <span class="mono">${escapeHtml(a.hashtags)}</span></div>
+    </div>`;
+  log('OK: cheap='+(j.cheap_count||0)+' / expensive='+(j.expensive_count||0));
+}
+
+async function doPublish({publish=true, use_gpt=true}) {
+  const slug  = inSlug.value.trim();
+  const limit = parseInt(inLimit.value||'10',10);
+  const catId = parseInt(inCatId.value||'9',10);
+  if (!slug) return alert('Укажи slug');
+
+  const url = `${publishUrl}?slug=${encodeURIComponent(slug)}&limit=${limit}&dle_category_id=${catId}&publish=${publish?1:0}&use_gpt=${use_gpt?1:0}`;
+  log('▶️ Публикация: ' + url.replace(location.origin,''));
+  const r = await fetch(url);
+  if (!r.ok) { log('Publish HTTP '+r.status); return; }
+  const j = await r.json();
+  if (!j.ok) { log('Publish error'); return; }
+  log('✅ post_id=' + j.post_id + ', published=' + j.published + ', cat=' + j.category);
+}
+
+document.getElementById('btnPreview').onclick = previewArticle;
+document.getElementById('btnPublish').onclick = () => doPublish({publish:true, use_gpt:true});
+document.getElementById('btnDraft').onclick   = () => doPublish({publish:false, use_gpt:true});
+document.getElementById('btnNoGpt').onclick   = () => doPublish({publish:true, use_gpt:false});
+
+document.getElementById('btnPing').onclick = async () => {
+  const a = await fetch(publishUrl+'?ping=1').then(r=>r.json()).catch(()=>null);
+  const b = await fetch(buildUrl  +'?ping=1').then(r=>r.json()).catch(()=>null);
+  log('Ping publish: ' + (a && a.ok ? 'ok' : 'fail'));
+  log('Ping build:   ' + (b && b.ok ? 'ok' : 'fail'));
+};
+
+// Пакетный режим
+let stopBatch = false;
+document.getElementById('btnStop').onclick = ()=>{ stopBatch = true; };
+document.getElementById('chAll').onclick = (e)=>{
+  document.querySelectorAll('.chRow').forEach(ch=>ch.checked = e.target.checked);
+};
+document.getElementById('btnBatch').onclick = async ()=>{
+  const limit  = parseInt(document.getElementById('inBLimit').value||'10',10);
+  const catId  = parseInt(document.getElementById('inBCatId').value||'9',10);
+  const pub    = document.getElementById('cbBPublish').checked;
+  const useGpt = document.getElementById('cbBGPT').checked;
+
+  const rows = Array.from(document.querySelectorAll('.chRow')).filter(x=>x.checked);
+  if (!rows.length) return alert('Отметь хотя бы одну категорию');
+
+  stopBatch = false;
+  let done=0;
+  for (let i=0;i<rows.length;i++){
+    if (stopBatch){ log('⏹ Остановлено'); break; }
+    const slug = rows[i].dataset.slug;
+    const url  = `${publishUrl}?slug=${encodeURIComponent(slug)}&limit=${limit}&dle_category_id=${catId}&publish=${pub?1:0}&use_gpt=${useGpt?1:0}`;
+    log(`▶️ [${i+1}/${rows.length}] ${slug}`);
+    try{
+      const r = await fetch(url);
+      const j = await r.json();
+      if (j && j.ok){
+        log(`✅ post_id=${j.post_id}, published=${j.published}`);
+      } else {
+        log(`❌ error on ${slug}`);
+      }
+    }catch(e){ log(`❌ HTTP error on ${slug}`); }
+    done++;
+    const pct = Math.round(done*100/rows.length);
+    document.getElementById('prog').style.width = pct+'%';
+    document.getElementById('prog').textContent = pct+'%';
+    document.getElementById('batchStat').textContent = `Готово ${done} из ${rows.length}`;
+    await new Promise(r=>setTimeout(r, 300)); // маленькая пауза
+  }
+};
+
+// инициализация
+loadCsv();
+</script>
+</body>
+</html>]]></replacecode>
+            <enabled>1</enabled>
+        </operation>
+    </file>
+    <file name="td_publish.php">
+        <operation action="create">
+            <replacecode><![CDATA[<?php
+declare(strict_types=1);
+
+// ------- лёгкая диагностика, чтобы понять: файл вообще выполняется? -------
+if (isset($_GET['ping'])) {
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode(['ok'=>true,'pong'=>date('c')], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+require_once __DIR__ . '/td_config.php';
+require_once __DIR__ . '/td_gpt.php';
+
+// ====== helpers ======
+function debug_enabled(): bool { return (int)($_GET['debug'] ?? 0) === 1; }
+function say($msg){ if(debug_enabled()){ echo '<div style="font:12px/1.4 monospace;color:#111;background:#f6f8fa;border-left:4px solid #2f81f7;padding:8px 10px;margin:6px 0;">'.$msg.'</div>'; } }
+function json_out($arr){ header('Content-Type: application/json; charset=utf-8'); echo json_encode($arr, JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT); exit; }
+function http_get_json(string $url): ?array {
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => 30,
+        CURLOPT_FOLLOWLOCATION => true,
+        CURLOPT_ENCODING       => 'gzip,deflate'
+    ]);
+    $body = curl_exec($ch);
+    $code = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    $err  = curl_error($ch);
+    curl_close($ch);
+    if ($code !== 200 || !$body) { return null; }
+    $j = json_decode($body, true);
+    return is_array($j) ? $j : null;
+}
+function base_origin(): string {
+    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+    $host   = $_SERVER['HTTP_HOST'] ?? 'localhost';
+    return $scheme . '://' . $host;
+}
+function same_dir_url(string $file): string {
+    // URL к файлу в той же директории: base_origin + dirname(request_uri) + file
+    $dir = rtrim(str_replace('\\','/', dirname($_SERVER['REQUEST_URI'] ?? '/')), '/');
+    if ($dir === '') $dir = '/';
+    return rtrim(base_origin().$dir, '/') . '/' . ltrim($file, '/');
+}
+function extract_cat_name_from_title(string $title, string $slug): string {
+    if (preg_match('~Лучшие\s+(.+?)\s+в\s+~u', $title, $m)) return trim($m[1]);
+    $t = str_replace(['-', '_'], ' ', $slug);
+    return mb_convert_case($t, MB_CASE_TITLE, 'UTF-8');
+}
+function translit_to_url(string $s): string {
+    $map = ['а'=>'a','б'=>'b','в'=>'v','г'=>'g','д'=>'d','е'=>'e','ё'=>'e','ж'=>'zh','з'=>'z','и'=>'i','й'=>'y','к'=>'k','л'=>'l','м'=>'m','н'=>'n','о'=>'o','п'=>'p','р'=>'r','с'=>'s','т'=>'t','у'=>'u','ф'=>'f','х'=>'h','ц'=>'c','ч'=>'ch','ш'=>'sh','щ'=>'sch','ъ'=>'','ы'=>'y','ь'=>'','э'=>'e','ю'=>'yu','я'=>'ya',' '=>'-','—'=>'-','–'=>'-','«'=>'','»'=>'','"'=>'','\''=>'','/'=>'-','\\'=>'-','&'=>'-','?'=>'',','=>'','.'=>'','('=>' ',')'=>' '];
+    $s = mb_strtolower($s, 'UTF-8');
+    $s = strtr($s, $map);
+    $s = preg_replace('~[^a-z0-9\-]+~', '-', $s);
+    $s = preg_replace('~-+~', '-', $s);
+    return trim($s, '-');
+}
+
+// ====== параметры ======
+$slug    = trim((string)($_GET['slug'] ?? ''));
+$limit   = max(1, (int)($_GET['limit'] ?? 10));
+$catId   = (int)($_GET['dle_category_id'] ?? DEFAULT_DLE_CAT_ID);
+$publish = (int)($_GET['publish'] ?? DEFAULT_PUBLISH); // 1=публиковать, 0=черновик
+$useGpt  = (int)($_GET['use_gpt'] ?? 1);
+
+if (debug_enabled()) { ini_set('display_errors','1'); error_reporting(E_ALL); }
+if (!$slug) {
+    if (debug_enabled()) { die('Param "slug" is required'); }
+    json_out(['ok'=>false,'error'=>'Param "slug" is required']);
+}
+
+// ====== 1) тянем сырую статью из билдера ======
+$builder = same_dir_url('td_build_article.php') . '?slug=' . urlencode($slug) . '&limit=' . $limit . '&json=1';
+say('Builder URL: <b>'.$builder.'</b>');
+
+$raw = http_get_json($builder);
+if (!$raw || empty($raw['ok']) || empty($raw['data'])) {
+    if (debug_enabled()) {
+        die('Build article failed (нет JSON от td_build_article.php). Проверь: файл существует, открывается напрямую и отдаёт json=1.');
+    }
+    json_out(['ok'=>false,'error'=>'Build article failed']);
+}
+$article = $raw['data'];
+say('Builder OK: получены поля title/short/full/meta');
+
+// ====== 2) GPT рерайт (по желанию) ======
+$catName = extract_cat_name_from_title($article['title'] ?? '', $slug);
+if ($useGpt) {
+    say('GPT: start rewrite…');
+    $article = td_gpt_rewrite($article, $catName, $slug);
+    say('GPT: done');
+} else {
+    say('GPT: пропущен (use_gpt=0)');
+}
+
+// ====== 3) публикация в DLE ======
+try {
+    $postId = dle_publish($article, $catId, (bool)$publish);
+    say('DLE: вставка выполнена, post_id='.$postId.', publish='.(int)(bool)$publish);
+} catch (Throwable $e) {
+    if (debug_enabled()) { die('DLE publish error: '.$e->getMessage()); }
+    json_out(['ok'=>false,'error'=>'DLE publish error']);
+}
+
+// ====== итог ======
+if (debug_enabled()) {
+    echo '<hr><pre style="font:12px/1.5 monospace;background:#fafafa;border:1px solid #eee;padding:8px;">'.
+         htmlspecialchars(json_encode(['ok'=>true,'post_id'=>$postId,'slug'=>$slug,'published'=>(bool)$publish,'category'=>$catId], JSON_UNESCAPED_UNICODE|JSON_PRETTY_PRINT)).
+         '</pre>';
+    exit;
+}
+json_out(['ok'=>true,'post_id'=>$postId,'slug'=>$slug,'published'=>(bool)$publish,'category'=>$catId]);
+
+// ====== DLE вставка ======
+function dle_publish(array $article, int $catId, bool $publish): int {
+    $mysqli = new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME);
+    if ($mysqli->connect_errno) {
+        throw new RuntimeException('DB connect: ' . $mysqli->connect_error);
+    }
+    $mysqli->set_charset(DB_CHARSET);
+
+    $title = (string)($article['title'] ?? '');
+    $short = (string)($article['short_story'] ?? '');
+    $full  = (string)($article['full_story'] ?? '');
+    $mt    = (string)($article['meta_title'] ?? '');
+    $mdesc = (string)($article['meta_description'] ?? '');
+    $tags  = (string)($article['hashtags'] ?? '');
+
+    if ($title === '' || $full === '') {
+        throw new RuntimeException('Empty title/full_story — ничего публиковать');
+    }
+
+    // защита от дублей
+    $escTitle = $mysqli->real_escape_string($title);
+    $dupSql   = "SELECT id FROM dle_post WHERE title='{$escTitle}' AND category='{$catId}' LIMIT 1";
+    $dupRes   = $mysqli->query($dupSql);
+    if ($dupRes && $dupRes->num_rows > 0) {
+        $row = $dupRes->fetch_assoc();
+        return (int)$row['id']; // уже есть
+    }
+
+    $date       = date('Y-m-d H:i:s');
+    $autor      = DEFAULT_AUTHOR;
+    $approve    = $publish ? 1 : 0;
+    $allow_comm = DEFAULT_ALLOW_COMM;
+    $allow_main = DEFAULT_ALLOW_MAIN;
+    $alt_name   = translit_to_url($title);
+
+    $stmt = $mysqli->prepare("
+        INSERT INTO dle_post
+          (autor, date, title, short_story, full_story, category, tags, alt_name, approve, allow_comm, allow_main, descr, metatitle)
+        VALUES
+          (?,     ?,    ?,     ?,           ?,          ?,        ?,    ?,        ?,       ?,          ?,         ?,     ?)
+    ");
+    if (!$stmt) {
+        throw new RuntimeException('DB prepare: ' . $mysqli->error);
+    }
+    $stmt->bind_param(
+        'sssssisiiiiss',
+        $autor, $date, $title, $short, $full, $catId, $tags, $alt_name, $approve, $allow_comm, $allow_main, $mdesc, $mt
+    );
+    if (!$stmt->execute()) {
+        throw new RuntimeException('DB execute: ' . $stmt->error);
+    }
+    $postId = (int)$stmt->insert_id;
+    $stmt->close();
+    $mysqli->close();
+    return $postId;
+}
+]]></replacecode>
+            <enabled>1</enabled>
+        </operation>
+    </file>
+    <file name="td_mass.php">
+        <operation action="create">
+            <replacecode><![CDATA[<?php
+declare(strict_types=1);
+ini_set('display_errors','0'); error_reporting(E_ALL);
+
+define('SITE_HOST', $_SERVER['HTTP_HOST'] ?? 'localhost');
+$csv = __DIR__ . '/td_cache/technodom_categories_links.csv';
+
+$limit   = max(1, (int)($_GET['limit'] ?? 5));     // сколько обработать за прогон
+$shuffle = (int)($_GET['shuffle'] ?? 1) === 1;     // перемешать?
+$catId   = (int)($_GET['dle_category_id'] ?? 0);   // DLE категория
+$publish = (int)($_GET['publish'] ?? 0);           // 0 — черновики, 1 — публикация
+
+if (!is_file($csv)) { header('Content-Type: text/plain; charset=utf-8'); echo "Нет CSV: {$csv}\n"; exit; }
+
+$rows = [];
+if (($fh = fopen($csv, 'r')) !== false) {
+  $header = fgetcsv($fh, 0, ';'); // заголовки
+  while (($r = fgetcsv($fh, 0, ';')) !== false) {
+    // Ожидаем колонки: Название рубрики;Slug;ASC;DESC;Sitemap URL
+    $rows[] = [
+      'name' => $r[0] ?? '',
+      'slug' => $r[1] ?? '',
+      'asc'  => $r[2] ?? '',
+      'desc' => $r[3] ?? ''
+    ];
+  }
+  fclose($fh);
+}
+$rows = array_values(array_filter($rows, fn($r)=> $r['slug'] && $r['asc'] && $r['desc']));
+
+if ($shuffle) shuffle($rows);
+$batch = array_slice($rows, 0, $limit);
+
+function callJson(string $url,int $timeout=40): array {
+  $ch = curl_init($url);
+  curl_setopt_array($ch,[
+    CURLOPT_RETURNTRANSFER=>true,
+    CURLOPT_FOLLOWLOCATION=>true,
+    CURLOPT_TIMEOUT=>$timeout,
+    CURLOPT_HTTPHEADER=>['Accept: application/json'],
+    CURLOPT_ENCODING=>'gzip,deflate'
+  ]);
+  $body = curl_exec($ch);
+  $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+  curl_close($ch);
+  if ($code!==200 || !$body) return [];
+  $j = json_decode($body, true);
+  return is_array($j)?$j:[];
+}
+
+header('Content-Type: text/plain; charset=utf-8');
+echo "TD MASS RUN | limit={$limit} | shuffle=".($shuffle?'1':'0')." | cat={$catId} | publish={$publish}\n\n";
+
+$ok=0; $fail=0;
+foreach ($batch as $r) {
+  $pubUrl = "https://".SITE_HOST."/td_publish.php"
+          ."?slug=".rawurlencode($r['slug'])
+          ."&name=".rawurlencode($r['name'])
+          ."&asc=".rawurlencode($r['asc'])
+          ."&desc=".rawurlencode($r['desc'])
+          ."&dle_category_id=".$catId
+          ."&publish=".$publish;
+
+  $res = callJson($pubUrl, 60);
+  if (!empty($res['ok'])) {
+    $ok++;
+    echo "✔ {$r['slug']} → post_id=".$res['post_id']."\n";
+  } else {
+    $fail++;
+    echo "✖ {$r['slug']} → ошибка\n";
+  }
+  usleep(120000); // щадим API
+}
+
+echo "\nГотово. Успешно: {$ok}, Ошибок: {$fail}\n";
+]]></replacecode>
+            <enabled>1</enabled>
+        </operation>
+    </file>
+    <file name="engine/inc/technodom_dashboard.php">
+        <operation action="create">
+            <replacecode><![CDATA[<?php
+if (!defined('DATALIFEENGINE') || !defined('LOGGED_IN')) {
+    header('HTTP/1.1 403 Forbidden');
+    header('Location: ../../');
+    die('Hacking attempt!');
+}
+
+global $config, $member_id;
+
+$scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+$host = $_SERVER['HTTP_HOST'] ?? ($_SERVER['SERVER_NAME'] ?? 'localhost');
+$homeUrl = trim((string)($config['http_home_url'] ?? ''));
+if ($homeUrl === '') {
+    $homeUrl = $scheme . '://' . $host;
+} elseif (!preg_match('~^https?://~i', $homeUrl)) {
+    $homeUrl = $scheme . '://' . $host . '/' . ltrim($homeUrl, '/');
+}
+$baseUrl = rtrim($homeUrl, '/');
+
+$dashboardUrl = $baseUrl . '/td_dashboard.php';
+$builderUrl   = $baseUrl . '/td_build_article.php';
+$publishUrl   = $baseUrl . '/td_publish.php';
+$massUrl      = $baseUrl . '/td_mass.php';
+$csvPath      = ROOT_DIR . '/td_cache/technodom_categories_links.csv';
+
+$hasCsv = is_file($csvPath);
+$csvInfo = $hasCsv
+    ? '<span class="status-ok">найден</span>'
+    : '<span class="status-miss">не найден</span>';
+
+if (!function_exists('echoheader') || !function_exists('echofooter')) {
+    die('DLE admin skin helpers missing');
+}
+
+echoheader('<i class="fa fa-plug"></i> Technodom Parser', 'Парсер Technodom → GPT → DLE');
+?>
+<style>
+    .tdp-links code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+    .tdp-links .status-ok { color: #198754; font-weight: 600; }
+    .tdp-links .status-miss { color: #dc3545; font-weight: 600; }
+    .tdp-iframe { width: 100%; min-height: 720px; border: 1px solid #dee2e6; border-radius: 12px; background: #fff; }
+</style>
+<div class="panel panel-default tdp-links">
+    <div class="panel-heading">
+        <strong>Technodom → GPT → DLE</strong>
+    </div>
+    <div class="panel-body">
+        <p>Инструменты для получения цен и товаров из Technodom, сборки статьи и публикации в DLE.</p>
+        <ol>
+            <li>Обновите CSV со списком категорий: <code>td_cache/technodom_categories_links.csv</code> — файл <?= $csvInfo ?>.</li>
+            <li>Нажмите кнопку «Предпросмотр» в дашборде ниже, чтобы проверить подборку и отредактировать перед публикацией.</li>
+            <li>Используйте кнопки «Опубликовать» / «Черновик» для одиночной записи или блок «Пакетная публикация».</li>
+        </ol>
+        <p class="small text-muted">Прямые ссылки: 
+            <a href="<?= htmlspecialchars($dashboardUrl, ENT_QUOTES, 'UTF-8'); ?>" target="_blank" rel="noopener">Дашборд</a>, 
+            <a href="<?= htmlspecialchars($builderUrl, ENT_QUOTES, 'UTF-8'); ?>?ping=1" target="_blank" rel="noopener">Builder ping</a>, 
+            <a href="<?= htmlspecialchars($publishUrl, ENT_QUOTES, 'UTF-8'); ?>?ping=1" target="_blank" rel="noopener">Publisher ping</a>, 
+            <a href="<?= htmlspecialchars($massUrl, ENT_QUOTES, 'UTF-8'); ?>" target="_blank" rel="noopener">Пакетный режим</a>.
+        </p>
+    </div>
+</div>
+<div class="panel panel-default">
+    <div class="panel-heading">Интерактивный дашборд</div>
+    <div class="panel-body">
+        <iframe class="tdp-iframe" src="<?= htmlspecialchars($dashboardUrl, ENT_QUOTES, 'UTF-8'); ?>" loading="lazy"></iframe>
+    </div>
+</div>
+<?php
+echofooter();
+]]></replacecode>
+            <enabled>1</enabled>
+        </operation>
+    </file>
+    <file name="engine/modules/technodom_dashboard.php">
+        <operation action="create">
+            <replacecode><![CDATA[<?php
+@error_reporting(E_ALL ^ E_NOTICE);
+@ini_set('display_errors', false);
+
+if (!defined('DATALIFEENGINE')) {
+    define('DATALIFEENGINE', true);
+}
+
+if (!defined('ROOT_DIR')) {
+    define('ROOT_DIR', dirname(__FILE__, 2));
+}
+
+if (!defined('ENGINE_DIR')) {
+    define('ENGINE_DIR', ROOT_DIR . '/engine');
+}
+require_once ENGINE_DIR . '/data/config.php';
+require_once ENGINE_DIR . '/classes/mysql.php';
+require_once ENGINE_DIR . '/data/dbconfig.php';
+require_once ENGINE_DIR . '/classes/plugins.class.php';
+
+include_once DLEPlugins::Check(ENGINE_DIR . '/inc/technodom_dashboard.php');
+
+]]></replacecode>
+            <enabled>1</enabled>
+        </operation>
+    </file>
+
+<file name="engine/engine.php">
+    <operation action="after">
+        <searchcode><![CDATA[   case "changemail":
+            include(DLEPlugins::Check(ENGINE_DIR . '/modules/changemail.php'));
+            break;]]></searchcode>
+        <replacecode><![CDATA[  case "technodom_parser":
+            include(DLEPlugins::Check(ENGINE_DIR . '/modules/technodom_dashboard.php'));
+            break;]]></replacecode>
+        <enabled>1</enabled>
+    </operation>
+</file>
+</dleplugin>
