@@ -3,7 +3,7 @@
 
 // 1) Хранение ключа OpenAI
 // ВАРИАНТ A: через переменную окружения (рекомендуется)
-$OPENAI_API_KEY = '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';
+$OPENAI_API_KEY = getenv('OPENAI_API_KEY') ?: '';
 
 // ВАРИАНТ B: через защищённый файл (вне webroot)
 //   $OPENAI_API_KEY = trim(@file_get_contents('/var/secure/openai.key') ?: '');
@@ -19,11 +19,11 @@ const OPENAI_MODEL   = 'gpt-4o-mini';  // быстро и Й; можно 'gpt-4o
 const OPENAI_BASEURL = 'https://api.openai.com/v1/chat/completions';
 const OPENAI_TIMEOUT = 25; // сек.
 
-// 3) DLE DB (заполните под себя)
-const DB_HOST = 'localhost';
-const DB_USER = 'p-350810_vaktau';
-const DB_PASS = '0pm6S?9k1';
-const DB_NAME = 'p-350810_vaktau';
+// 3) DLE DB (заполните под себя или подключите общий конфиг)
+const DB_HOST = 'localhost';       // например, 127.0.0.1
+const DB_USER = 'dle_user';       // пользователь БД
+const DB_PASS = 'dle_password';   // пароль БД
+const DB_NAME = 'dle_database';   // имя БД
 const DB_CHARSET = 'utf8mb4';
 
 // 4) Параметры публикации
